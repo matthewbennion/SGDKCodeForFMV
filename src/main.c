@@ -1,24 +1,21 @@
 #include <genesis.h>
 
 #include "gfx.h"
-// 8, 11025, 13, 16, 22050, 32
 #include "music.h"
 
 // 7.5 FPS = 40, 12 FPS = 25, 15 FPS = 20, 20 FPS = 15, 25 FPS = 12  //
-#define PAL_FRAME_DELAY 25
-#define NTSC_FRAME_DELAY 25
-#define PAL_TILES_PER_VBLANK 544
-#define NTSC_TILES_PER_VBLANK 205
-#define MAX_TILES_PER_FRAME 405
-#define NUMBER_OF_FRAMES 785
+#define PAL_FRAME_DELAY 12
+#define NTSC_FRAME_DELAY 10
 #define MUSIC_START_FRAME 1
 
 static void nextFrame();
+static void processMap(Map* map, u16 baseInd, u16 xt, u16 yt);
 
 static void joyEvent(u16 joy, u16 changed, u16 state);
 
 static void hint();
 static void vint();
+static void doSync();
 
 const Image *images[] =
 {
@@ -770,22 +767,36 @@ const u16 noOfFrames = sizeof(images) / sizeof(Image*);
 u16 ind;
 TileSet* tileset;
 Map* map;
-Palette* palette;
 u16 indBase;
-u16 frame;
-u16 lastNumTile;
+u16 vpos;
 vu16 frameDone;
+s32 frameDelay;
+u32 lastGetTick = 0;
 
 int main()
 {
+    // disable VInt alignment
+    SYS_setVIntAligned(FALSE);
     SYS_setHIntCallback(hint);
     SYS_setVIntCallback(vint);
+
+    // set no limit to DMA
+    DMA_setMaxTransferSize(0);
+    // disable auto flush for DMA queue
+    DMA_setAutoFlush(FALSE);
 
     // disable interrupt when accessing VDP
     SYS_disableInts();
 
     // initialization
     VDP_setScreenWidth320();
+
+    // reset plan configuration
+    VDP_setAPlanAddress(0xC000);
+    VDP_setBPlanAddress(0xE000);
+    VDP_setSpriteListAddress(0xB000);
+    VDP_setHScrollTableAddress(0xB800);
+    // set plan size to 64x64
     VDP_setPlanSize(64, 64);
 
     // load background A
@@ -799,15 +810,21 @@ int main()
     // enable hint
     VDP_setHInterrupt(TRUE);
 
+    if (IS_PALSYSTEM) {
+        frameDelay = PAL_FRAME_DELAY;
+    } else {
+        frameDelay = NTSC_FRAME_DELAY;
+    }
+
     // re-enable ints
     SYS_enableInts();
 
     ind += border.tileset->numTile;
 
-    frame = 0;
-    indBase = ind;
     tileset = allocateTileSetEx(512);
-    map = allocateMapEx(256/8, 200/8);
+    map = allocateMapEx(256 / 8, 200 / 8);
+    indBase = ind;
+    vpos = 0;
     frameDone = FALSE;
 
     JOY_setEventHandler(joyEvent);
@@ -822,22 +839,82 @@ int main()
 
 static void nextFrame()
 {
+    doSync();
+
+    static u16 pal = PAL0;
+    static u16 frame = 0;
+
+    if (frame == MUSIC_START_FRAME) {
+        SND_startPlay_PCM(sound, sizeof(sound), SOUND_RATE_11025, SOUND_PAN_CENTER, 0);
+    }
+
     // sync (wait for frame to be sent to VDP)
     while(frameDone);
 
+    SYS_disableInts();
+
+    const Image *image = images[frame];
+    const u16 numTile = image->tileset->numTile;
+
+    // fix tile index if needed
+    if ((ind + numTile) >= TILE_USERMAXINDEX) ind = indBase;
+
+    // unpack tileset and tilemap
+    unpackTileSet(image->tileset, tileset);
+    unpackMap(image->map, map);
+
+    // send to DMA queue
+    DMA_queueDma(DMA_VRAM, (u32) tileset->tiles, ind * 32, numTile * 16, 2);
+    processMap(map, TILE_ATTR_FULL(pal, FALSE, FALSE, FALSE, ind), 4, vpos + ((224 - 184) / (8 * 2)));
+    DMA_queueDma(DMA_CRAM, (u32) image->palette->data, pal * 16 * 2, 16, 2);
+
+    ind += numTile;
+    pal ^= 1;
+    vpos ^= 0x20;
     frame++;
     if (frame >= noOfFrames) frame = 0;
 
-    const Image *image = images[frame];
-    unpackTileSet(image->tileset, tileset);
-    unpackMap(image->map, map);
-    palette = image->palette;
-    lastNumTile = image->tileset->numTile;
-
-    if ((ind + lastNumTile) >= TILE_USERMAXINDEX)
-        ind = indBase;
-
     frameDone = TRUE;
+
+    // re-enable ints
+    SYS_enableInts();
+}
+
+static void processMap(Map* map, u16 baseInd, u16 xt, u16 yt)
+{
+    u16* src = map->tilemap;
+    const u16 w = map->w;
+    u16 h = map->h;
+
+    // set base index info into tilemap data
+    u16 i = w * h;
+    while(i--) *src++ += baseInd;
+
+    src = map->tilemap;
+    // initialize map VRAM destination address
+    u16 adr = VDP_getBPlanAddress() + ((xt + (yt * 64)) * 2);
+
+    // send map data through DMA queue
+    while(h--)
+    {
+        DMA_queueDma(DMA_VRAM, (u32) src, adr, w, 2);
+        src += w;
+        adr += 64 * 2;
+    }
+}
+
+static void doSync()
+{
+   u32 tick;
+   s32 delta;
+   s32 over;
+   do {
+        tick = getTick();
+        delta = tick - lastGetTick;
+        over = delta - frameDelay;
+   }
+   while (over < 0);
+   lastGetTick = tick - over;
 }
 
 static void joyEvent(u16 joy, u16 changed, u16 state)
@@ -847,25 +924,13 @@ static void joyEvent(u16 joy, u16 changed, u16 state)
 
 static void hint()
 {
-    static u16 pal = PAL0;
-    static u16 vpos = 0;
-
     if (frameDone)
     {
-        VDP_setEnable(FALSE);
-
-        VDP_setVerticalScroll(PLAN_B, (vpos ^ 0x20) * 8);
-        VDP_loadTileData(tileset->tiles, ind, lastNumTile, DMA_QUEUE);
-        VDP_setPalette(pal, palette->data);
-
+        //VDP_setEnable(FALSE);
+        DMA_flushQueue();
         VDP_setEnable(TRUE);
 
-        // setMap is slow so better to have VDP enable before
-        VDP_setMap(PLAN_B, map, TILE_ATTR_FULL(pal, FALSE, FALSE, FALSE, ind), 4, vpos + ((224 - 184) / (8 * 2)));
-
-        ind += lastNumTile;
-        pal ^= 1;
-        vpos ^= 0x20;
+        VDP_setVerticalScroll(PLAN_B, (vpos ^ 0x20) * 8);
         VDP_showFPS(FALSE);
 
         frameDone = FALSE;
